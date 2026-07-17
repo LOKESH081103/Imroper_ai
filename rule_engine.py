@@ -46,7 +46,7 @@ INDIAN_CITY_HINTS = {
     "RANCHI", "HOWRAH", "COIMBATORE", "JABALPUR", "GWALIOR", "VIJAYAWADA", "JODHPUR",
     "MADURAI", "RAIPUR", "KOTA", "GUWAHATI", "CHANDIGARH", "SOLAPUR", "HUBLI",
     "MYSORE", "MYSURU", "TIRUCHIRAPPALLI", "TRICHY", "BAREILLY", "ALIGARH",
-    "MORADABAD", "SALEM", "THIRUVANANTHAPURAM","Thiruvarur", "TRIVANDRUM", "BHIWANDI",
+    "MORADABAD", "SALEM", "THIRUVANANTHAPURAM", "THIRUVARUR", "TIRUVARUR", "TRIVANDRUM", "BHIWANDI",
     "SAHARANPUR", "GORAKHPUR", "GUNTUR", "BIKANER", "AMRAVATI", "NOIDA", "GREATER NOIDA",
     "JAMSHEDPUR", "BHILAI", "WARANGAL", "CUTTACK", "KOCHI", "COCHIN", "NELLORE",
     "BHAVNAGAR", "DEHRADUN", "DURGAPUR", "ASANSOL", "ROURKELA", "NANDED", "KOLHAPUR",
@@ -143,6 +143,13 @@ INDIAN_CITY_HINTS = {
     "VIJAYAWADA", "VILLUPURAM", "VIRAR", "VISAKHAPATNAM", "VIZAG", "VIZIANAGARAM", 
     "WARDHA", "WARANGAL", "YAMUNANAGAR", "YAVATMAL",
 }
+# Defensive: normalize every entry to uppercase, since the membership check
+# below always compares against addr.upper(). Without this, a single
+# mixed-case entry added by mistake (it's happened - "Thiruvarur" instead of
+# "THIRUVARUR" silently never matched anything) breaks detection for that
+# city with no error or warning anywhere. This makes that whole class of
+# bug impossible, no matter how entries get added to this set in future.
+INDIAN_CITY_HINTS = {c.upper() for c in INDIAN_CITY_HINTS}
 
 PLACEHOLDER_PHRASES = {
     "NA", "N A", "N/A", "N.A", "N.A.", "NIL", "NONE", "XXX", "XXXX", "XYZ", "ABC",
@@ -160,7 +167,7 @@ FOREIGN_LOCATION_HINTS = {
 CRITICAL_ISSUE_PREFIXES = {
     "EMPTY_ADDRESS", "MISSING_PINCODE", "PINCODE_NOT_FOUND_IN_INDIA",
     "PLACEHOLDER_ADDRESS", "ADDRESS_TOO_SHORT",
-    "PINCODE_DUPLICATED", "HOUSE_NO_ZERO_OR_PLACEHOLDER", "MISSING_HOUSE_OR_PLOT_NUMBER",
+    "HOUSE_NO_ZERO_OR_PLACEHOLDER", "MISSING_HOUSE_OR_PLOT_NUMBER",
 }
 # Deliberately NOT critical, per business call: these are recoverable/cosmetic
 # ("not that big a deal") rather than "can't identify the address at all" -
@@ -169,6 +176,13 @@ CRITICAL_ISSUE_PREFIXES = {
 # it's still there to read) stay Warning. Everything else not listed above
 # also stays Warning by default - Critical is reserved for "no way to
 # identify/deliver this address," not every structural quirk.
+#
+# PINCODE_DUPLICATED moved out of Critical on 2026-07-17: real data showed
+# this is overwhelmingly a source-system artifact (the city/state/pincode
+# field got concatenated twice, e.g. "...Odisha, 769009769009") rather than
+# a genuinely broken address - the correct pincode is right there, just
+# repeated. The address is still fully deliverable, so it's a Warning like
+# the other cosmetic issues, not a Critical.
 
 ISSUE_DESCRIPTIONS = {
     "EMPTY_ADDRESS": "Address field is blank",
@@ -246,19 +260,33 @@ def layer1_structural(addr: str, tokens, pins, min_words: int = 5, merge_len_thr
     if repeated:
         issues.append(f"REPEATED_PHRASE({repeated[0]})")
 
-    if len(tokens) < min_words:
+    # Compute merged-word detection FIRST: if a giant glued-together token is
+    # present (e.g. "STREETTempleThiruvarur" instead of three separate
+    # words), the plain token count is artificially deflated by the merge
+    # itself - that's not a genuinely short/incomplete address, it's the
+    # same merge problem showing up twice. Only fire ADDRESS_TOO_SHORT when
+    # the address is short for real, not as a side effect of words being
+    # stuck together (which is already flagged - as a Warning - below).
+    long_tokens = [t for t in tokens if len(t) >= merge_len_threshold and t not in COMMON_SAFE_LONG_WORDS]
+
+    if len(tokens) < min_words and not long_tokens:
         issues.append("ADDRESS_TOO_SHORT")
 
-    long_tokens = [t for t in tokens if len(t) >= merge_len_threshold and t not in COMMON_SAFE_LONG_WORDS]
     if long_tokens:
         issues.append(f"POSSIBLE_MERGED_WORDS({long_tokens[0]})")
 
-    # Catches "# 0" (explicit placeholder marker) as well as a bare "0"
-    # sitting on its own anywhere in the address (e.g. "0 Shanti Nagar...")
-    # - a very common way people encode "house number wasn't captured" in
-    # source systems. \b...\b means this never matches the "0"s inside a
-    # real multi-digit number (those aren't standalone tokens).
-    if re.search(r"#\s*0\b", addr) or re.search(r"\b0\b", addr):
+    # Catches "# 0" (explicit placeholder marker) as well as "H.No 0" /
+    # "House No 0" / "Flat No 0" / "Door No 0" / "Plot No 0" - a very
+    # common way people encode "house number wasn't captured" in source
+    # systems. Deliberately scoped to those specific labels rather than any
+    # standalone "0" anywhere in the address: fields like "Gali No-0" or
+    # "Ward No-0" are legitimate lane/ward identifiers (numbering from
+    # zero is normal for those), not a missing-house-number placeholder,
+    # and flagging every bare 0 in the text produced false positives on
+    # real addresses that already had a proper house number elsewhere.
+    if re.search(r"#\s*0\b", addr) or re.search(
+        r"(?:H\.?\s*NO|HOUSE\s*NO|FLAT\s*NO|DOOR\s*NO|PLOT\s*NO)\.?\s*[-:]?\s*0\b", addr, re.IGNORECASE
+    ):
         issues.append("HOUSE_NO_ZERO_OR_PLACEHOLDER")
     elif not _has_specific_location_number(addr, pins):
         # No "# 0"-style placeholder, but also nothing that looks like a
@@ -294,22 +322,58 @@ def _has_specific_location_number(addr: str, pins) -> bool:
 # in pincode_lookup.py)
 # ----------------------------------------------------------------------
 _PIN_PATTERN = re.compile(r"\b(\d{3})[ -](\d{3})\b|\b(\d{6})\b")
+_DUPLICATED_PIN = re.compile(r"(\d{6})\1")
+_LONG_DIGIT_RUN = re.compile(r"\d{7,}")
+# House/plot/quarter/khata/door/room numbers that happen to BE 6 digits
+# (e.g. "QUARTER NO.217218") look identical to a pincode to a bare digit
+# regex. Track anything immediately following one of these labels so it
+# can be de-prioritized below, rather than sent to the pincode API as if
+# it were a real pincode.
+_LABELED_NUMBER_BEFORE_PIN = re.compile(
+    r"(?:H\.?\s*NO|HOUSE\s*NO|FLAT\s*NO|DOOR\s*NO|PLOT\s*NO|QUARTER\s*NO|KHATA\s*NO|ROOM\s*NO)"
+    r"\.?\s*[-:]?\s*(\d{6})\b",
+    re.IGNORECASE,
+)
 
 
 def extract_pins(addr: str):
     """
-    Pulls out 6-digit Indian pincodes. Handles the plain, glued-together
-    form (400001) as well as the equally common "split" form some people
-    write it in - a space or hyphen between the two halves, e.g.
-    "600 037" or "600-037" (both mean pincode 600037). Both normalize to
-    the same 6-digit string so Layer 2's pincode lookup treats them
-    identically to the plain form.
+    Pulls out 6-digit Indian pincodes. Handles:
+      - plain (400001) and split (600 037 / 600-037) forms
+      - glued to a preceding LETTER, e.g. "MUMBAI400206"
+      - glued to a preceding DIGIT, e.g. "...NAGAR 9333001" (door no. 9 +
+        pincode 333001, no separator) or a stray leading digit typo like
+        "2614018" for 614018 - both are 7+ digit runs where a plain \\b
+        boundary can never match; take the LAST 6 digits, since Indian
+        pincodes are conventionally the last thing written in an address
+      - duplicated back-to-back with no separator, e.g. "769009769009"
+        (a common source-system artifact) - same boundary problem, extract
+        the base 6 digits instead of finding nothing at all
+
+    Also de-prioritizes a 6-digit number that's clearly a labeled house/
+    plot/quarter/khata number (e.g. "QUARTER NO.217218") rather than a
+    pincode, as long as some other genuine pincode candidate exists in the
+    same address - keeps a lone labeled number as a fallback rather than
+    reporting no pincode at all if it turns out to be the only candidate.
     """
     pins = set()
+
+    for m in _DUPLICATED_PIN.finditer(addr):
+        pins.add(m.group(1))
+
     for m in _PIN_PATTERN.finditer(addr):
         pins.add(m.group(3) if m.group(3) else m.group(1) + m.group(2))
-    glued_pins = set(re.findall(r"[A-Za-z](\d{6})\b", addr))
-    return pins | glued_pins
+
+    pins |= set(re.findall(r"[A-Za-z](\d{6})\b", addr))
+
+    for run in _LONG_DIGIT_RUN.findall(addr):
+        pins.add(run[-6:])
+
+    labeled_house_numbers = set(_LABELED_NUMBER_BEFORE_PIN.findall(addr))
+    if labeled_house_numbers and (pins - labeled_house_numbers):
+        pins -= labeled_house_numbers
+
+    return pins
 
 
 def layer2_issues_from_results(addr_upper: str, pins: set, pin_results: dict):
